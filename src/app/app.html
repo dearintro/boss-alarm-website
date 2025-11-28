@@ -1,0 +1,375 @@
+<main class="page">
+  <header class="hero">
+    <p class="hero__eyebrow">Boss Alarm Dashboard</p>
+    <h1>เว็บกรอกเวลาแจ้งเตือนบอส By พี่เดียร์สุดหล่อแห่ง B10</h1>
+    <p class="hero__subtitle">
+      กรอกตารางเวลาที่ได้รับมาเพียงครั้งเดียว ระบบจะช่วยคำนวณเวลาปลุกเตือนล่วงหน้าให้โดยอัตโนมัติ
+    </p>
+  </header>
+
+  <section class="section form-section">
+    <header class="section__header">
+      <h2>ฟอร์มกรอกข้อมูลบอส</h2>
+      <p>รองรับการวางข้อความหลายบรรทัดตามรูปแบบที่กำหนดไว้ด้านบน</p>
+    </header>
+
+    <div class="control-bar">
+      <div class="control-bar__group">
+        <label class="control-bar__label" for="volumeControl">
+          ระดับเสียงแจ้งเตือน
+        </label>
+        <div class="control-bar__input">
+          <input
+            id="volumeControl"
+            type="range"
+            min="0"
+            max="100"
+            [value]="volumePercent()"
+            (input)="onVolumeInput($event)"
+          />
+          <span class="control-bar__value">{{ volumePercent() }}%</span>
+        </div>
+      </div>
+
+      <div class="control-bar__group">
+        <label class="control-bar__label" for="alertSoundSelect">เสียงแจ้งเตือน</label>
+        <div class="control-bar__input">
+          <select id="alertSoundSelect" [value]="selectedAlertSoundId()" (change)="onAlertSoundSelect($event)">
+            @for (option of alertSoundOptions(); track option.id) {
+              <option [value]="option.id" [disabled]="option.disabled">{{ option.label }}</option>
+            }
+          </select>
+        </div>
+        @if (!speechAvailable()) {
+          <p class="control-bar__hint control-bar__hint--warning">
+            เบราว์เซอร์ของคุณไม่รองรับการอ่านข้อความเป็นเสียง ระบบจะใช้ไฟล์เสียงที่เลือกแทน
+          </p>
+        }
+      </div>
+
+      <div class="control-bar__group control-bar__group--upload">
+        <label class="control-bar__label" for="alertSoundUpload">อัปโหลดเสียงใหม่ (.mp3 เท่านั้น)</label>
+        <div class="control-bar__input control-bar__input--file">
+          <input id="alertSoundUpload" type="file" accept=".mp3,audio/mpeg" (change)="onAlertSoundUpload($event)" />
+        </div>
+        @if (uploadError()) {
+          <p class="control-bar__hint control-bar__hint--warning">{{ uploadError() }}</p>
+        }
+        @if (uploadedSounds().length) {
+          <ul class="upload-list">
+            @for (sound of uploadedSounds(); track sound.id) {
+              <li class="upload-list__item">
+                <span class="upload-list__label">{{ sound.label }}</span>
+                <button type="button" class="ghost-button ghost-button--remove" (click)="removeUploadedSound(sound.id)">
+                  ลบ
+                </button>
+              </li>
+            }
+          </ul>
+        }
+      </div>
+    </div>
+
+    <form class="boss-form" [formGroup]="bossForm" (ngSubmit)="submitBosses()">
+      <div class="form-field">
+        <label for="rawInput">กรอกข้อมูลบอส</label>
+        <textarea
+          id="rawInput"
+          rows="12"
+          placeholder="วางข้อความที่มีรูปแบบ 🕐 21:53 - **ออร์เฟน - Orfen (Orfen's Lair)** (ของ มึนงง)"
+          formControlName="rawInput"
+        ></textarea>
+        @if (bossForm.controls.rawInput.invalid && bossForm.controls.rawInput.touched) {
+          <p class="form-field__error">กรุณากรอกข้อมูลอย่างน้อย 1 บรรทัด</p>
+        }
+      </div>
+
+      <div class="form-field">
+        <label for="serverType">ประเภทเซิฟเวอร์</label>
+        <select id="serverType" formControlName="serverType">
+          @for (option of serverOptions; track option.value) {
+            <option [value]="option.value">{{ option.label }}</option>
+          }
+        </select>
+      </div>
+
+      <div class="form-actions">
+        <button type="submit">เพิ่มรายการบอส</button>
+      </div>
+    </form>
+
+    @if (parsingErrors().length) {
+      <div class="form-errors" role="alert">
+        <h3>รายการที่ไม่สามารถอ่านได้</h3>
+        <ul>
+          @for (error of parsingErrors(); track error) {
+            <li>{{ error }}</li>
+          }
+        </ul>
+      </div>
+    }
+  </section>
+
+  <section class="section list-section">
+    <header class="section__header">
+      <h2>ตารางลิสต์บอส</h2>
+      <p>เราจะเติมข้อมูลและการแจ้งเตือนในขั้นถัดไปหลังจากคุณยืนยัน</p>
+    </header>
+
+    <div class="filter-bar">
+      <label class="filter-bar__label" for="clanFilter">กรองตามแคลนเจ้าของ</label>
+      <select id="clanFilter" class="filter-bar__select" [value]="clanFilter()" (change)="onClanSelect($event)">
+        <option value="all">ทั้งหมด</option>
+        @for (clan of clanOptions(); track clan) {
+          <option [value]="clan">{{ clan }}</option>
+        }
+      </select>
+    </div>
+
+    <div class="tab-group" role="tablist" aria-label="Boss data tabs">
+      <button
+        type="button"
+        class="tab-button"
+        [class.tab-button--active]="activeTab() === 'upcoming'"
+        (click)="selectTab('upcoming')"
+        role="tab"
+        [attr.aria-selected]="activeTab() === 'upcoming'"
+      >
+        กำลังจะถึง
+        <span class="tab-button__badge">{{ bosses().length }}</span>
+      </button>
+      <button
+        type="button"
+        class="tab-button"
+        [class.tab-button--active]="activeTab() === 'history'"
+        (click)="selectTab('history')"
+        role="tab"
+        [attr.aria-selected]="activeTab() === 'history'"
+      >
+        Boss History
+        <span class="tab-button__badge">{{ history().length }}</span>
+      </button>
+    </div>
+
+    <div class="tab-panels">
+      @if (activeTab() === 'upcoming') {
+        @if (bosses().length === 0) {
+          <p class="empty-state">ยังไม่มีข้อมูลบอสที่บันทึก กรุณากรอกฟอร์มด้านบน</p>
+        } @else if (filteredBosses().length === 0) {
+          <p class="empty-state empty-state--muted">ไม่มีบอสที่ตรงกับแคลนนี้ในรายการที่กำลังจะถึง</p>
+        } @else {
+          <div class="table-wrapper">
+            <table class="boss-table">
+              <thead>
+                <tr>
+                  <th>เวลาแจ้งเตือน</th>
+                  <th>เวลาเกิด</th>
+                  <th>รายละเอียดบอส</th>
+                  <th>ปรับเวลา</th>
+                  <th>จัดการ</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (boss of filteredBosses(); track boss.id) {
+                  <tr>
+                    <td data-label="เวลาแจ้งเตือน">
+                      <div class="cell-block">
+                        <span class="time-badge time-badge--alert">{{ boss.alertLabel }}</span>
+                        <span class="cell-subtext">เหลืออีก {{ timeUntilAlert(boss) }}</span>
+                      </div>
+                    </td>
+                    <td data-label="เวลาเกิด">
+                      <div class="cell-block">
+                        <span class="time-badge">{{ displayTime(boss.spawnTime) }}</span>
+                        <span class="cell-subtext">จะเกิดใน {{ timeUntilSpawn(boss) }}</span>
+                      </div>
+                    </td>
+                    <td data-label="รายละเอียดบอส">
+                      <div class="boss-meta">
+                        <div class="boss-meta__header">
+                          <strong>{{ boss.name }}</strong>
+                          <span class="status-chip" [class.status-chip--active]="bossStatus(boss) === 'เกิดแล้ว'">
+                            {{ bossStatus(boss) }}
+                          </span>
+                        </div>
+                        <ul class="boss-meta__list">
+                          <li>
+                            <span class="meta-label">แมพ</span>
+                            <span class="meta-value">{{ boss.map }}</span>
+                          </li>
+                          <li>
+                            <span class="meta-label">แคลนเจ้าของ</span>
+                            <span class="meta-value">{{ boss.clan }}</span>
+                          </li>
+                          <li class="boss-meta__server">
+                            <span class="meta-label">เซิฟเวอร์</span>
+                            <span class="meta-value">
+                              <span class="server-chip" [class.server-chip--cross]="boss.serverType === 'cross'">
+                                {{ serverLabel(boss.serverType) }}
+                              </span>
+                            </span>
+                          </li>
+                        </ul>
+                      </div>
+                    </td>
+                    <td data-label="ปรับเวลา">
+                      <div class="adjust-group">
+                        @for (option of adjustOptions; track option) {
+                          <button
+                            type="button"
+                            class="ghost-button adjust-button"
+                            [class.adjust-button--active]="boss.leadMinutes === option"
+                            [attr.aria-pressed]="boss.leadMinutes === option"
+                            [disabled]="isAdjustDisabled(boss, option)"
+                            (click)="adjustAlertLead(boss, option, $event)"
+                          >
+                            @if (option === defaultLeadMinutes) {
+                              <span>{{ option }} นาที (ค่าเริ่มต้น)</span>
+                            } @else {
+                              <span>{{ option }} นาที</span>
+                            }
+                          </button>
+                        }
+                      </div>
+                    </td>
+                    <td data-label="จัดการ">
+                      <div class="action-stack">
+                        <button type="button" class="ghost-button ghost-button--copy" (click)="copyBoss(boss)">
+                          คัดลอก
+                        </button>
+                        <button
+                          type="button"
+                          class="ghost-button ghost-button--danger"
+                          (click)="requestBossRemoval(boss.id)"
+                        >
+                          ลบ
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        }
+      }
+
+      @if (activeTab() === 'history') {
+        @if (history().length === 0) {
+          <p class="empty-state">ยังไม่มีประวัติบอสที่แจ้งเตือน</p>
+        } @else if (filteredHistory().length === 0) {
+          <p class="empty-state empty-state--muted">ไม่มีประวัติที่ตรงกับแคลนนี้</p>
+        } @else {
+          <div class="table-wrapper">
+            <table class="boss-table">
+              <thead>
+                <tr>
+                  <th>แจ้งเตือนเมื่อ</th>
+                  <th>เวลาแจ้งเตือนที่ตั้ง</th>
+                  <th>เวลาเกิดจริง</th>
+                  <th>ชื่อบอส</th>
+                  <th>แมพ</th>
+                  <th>แคลนเจ้าของ</th>
+                  <th>เซิฟเวอร์</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (record of filteredHistory(); track record.id) {
+                  <tr>
+                    <td data-label="แจ้งเตือนเมื่อ">
+                      <span class="time-badge time-badge--alert">{{ displayTime(record.triggeredAt) }}</span>
+                    </td>
+                    <td data-label="เวลาแจ้งเตือนที่ตั้ง">
+                      <span class="time-badge">{{ record.alertLabel }}</span>
+                    </td>
+                    <td data-label="เวลาเกิดจริง">
+                      <span class="time-badge">{{ displayTime(record.spawnTime) }}</span>
+                    </td>
+                    <td data-label="ชื่อบอส">
+                      <strong>{{ record.name }}</strong>
+                    </td>
+                    <td data-label="แมพ">{{ record.map }}</td>
+                    <td data-label="แคลนเจ้าของ">{{ record.clan }}</td>
+                    <td data-label="เซิฟเวอร์">
+                      <span class="server-chip" [class.server-chip--cross]="record.serverType === 'cross'">
+                        {{ serverLabel(record.serverType) }}
+                      </span>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        }
+      }
+    </div>
+  </section>
+</main>
+
+@if (activeAlert(); as alert) {
+  <div class="modal-backdrop">
+    <div
+      class="modal"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="alertModalTitle"
+      aria-describedby="alertModalBody"
+    >
+      <header class="modal__header">
+        <h2 id="alertModalTitle">ถึงเวลาเตือนบอสแล้ว!</h2>
+        <button type="button" class="ghost-button ghost-button--close" (click)="stopAlert()" aria-label="ปิดการแจ้งเตือน">×</button>
+      </header>
+      <div class="modal__body" id="alertModalBody">
+        <p class="modal__eyebrow">แจ้งเตือนสำหรับ {{ serverLabel(alert.serverType) }}</p>
+        <h3>{{ alert.name }}</h3>
+        <p class="modal__meta">แมพ {{ alert.map }} • ของแคลน {{ alert.clan }}</p>
+        <dl class="modal__times">
+          <div>
+            <dt>เวลาแจ้งเตือน</dt>
+            <dd>{{ displayTime(alert.alertTime) }}</dd>
+          </div>
+          <div>
+            <dt>เวลาเกิดจริง</dt>
+            <dd>{{ displayTime(alert.spawnTime) }}</dd>
+          </div>
+        </dl>
+      </div>
+      <footer class="modal__footer">
+        <p class="modal__countdown">หยุดเสียงอัตโนมัติใน {{ countdownSeconds() }} วิ</p>
+        <button type="button" class="primary-button" (click)="stopAlert()">หยุดการแจ้งเตือน</button>
+      </footer>
+    </div>
+  </div>
+}
+
+@if (deleteConfirmation(); as pending) {
+  <div class="modal-backdrop modal-backdrop--confirm">
+    <div
+      class="modal modal--confirm"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="confirmModalTitle"
+      aria-describedby="confirmModalBody"
+    >
+      <header class="modal__header">
+        <h2 id="confirmModalTitle">ยืนยันการลบรายการบอส</h2>
+        <button type="button" class="ghost-button ghost-button--close" (click)="cancelBossRemoval()" aria-label="ยกเลิกการลบ">×</button>
+      </header>
+      <div class="modal__body" id="confirmModalBody">
+        <p class="modal__eyebrow">คุณกำลังจะลบ</p>
+        <h3>{{ pending.name }}</h3>
+        <p class="modal__meta">การลบนี้จะเอารายการออกจากตารางและยกเลิกการแจ้งเตือนที่ตั้งไว้</p>
+      </div>
+      <footer class="modal__footer modal__footer--confirm">
+        <div class="modal__actions">
+          <button type="button" class="ghost-button ghost-button--wide" (click)="cancelBossRemoval()">
+            ยกเลิก
+          </button>
+          <button type="button" class="primary-button primary-button--danger" (click)="confirmBossRemoval()">
+            ลบรายการ
+          </button>
+        </div>
+      </footer>
+    </div>
+  </div>
+}
