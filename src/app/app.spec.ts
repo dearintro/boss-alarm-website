@@ -1,10 +1,18 @@
 import { TestBed } from '@angular/core/testing';
+import { of } from 'rxjs';
 import { App } from './app';
+import { GoogleSheetService } from './services/google-sheet.service';
 
 describe('App', () => {
+  let sheetServiceSpy: jasmine.SpyObj<GoogleSheetService>;
+
   beforeEach(async () => {
+    sheetServiceSpy = jasmine.createSpyObj<GoogleSheetService>('GoogleSheetService', ['fetchBossList']);
+    sheetServiceSpy.fetchBossList.and.returnValue(of([]));
+
     await TestBed.configureTestingModule({
       imports: [App],
+      providers: [{ provide: GoogleSheetService, useValue: sheetServiceSpy }]
     }).compileComponents();
   });
 

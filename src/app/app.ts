@@ -1,6 +1,8 @@
 import { CommonModule } from '@angular/common';
-import { Component, OnDestroy, computed, signal } from '@angular/core';
+import { Component, OnDestroy, computed, inject, signal } from '@angular/core';
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
+import { Subscription } from 'rxjs';
+import { GoogleSheetService, SheetBossListItem } from './services/google-sheet.service';
 
 type ServerType = 'own' | 'cross';
 
@@ -55,6 +57,7 @@ interface BossEntry {
   alertTriggered: boolean;
   triggeredAt: Date | null;
   leadMinutes: number;
+  sourceKey?: string | null;
 }
 
 interface BossHistoryEntry {
@@ -113,6 +116,11 @@ export class App implements OnDestroy {
   private readonly builtinAudioOptions: readonly AlertSoundOption[] = buildBuiltinSoundOptions();
   private readonly uploadedSoundOptions = signal<AlertSoundOption[]>([]);
   private readonly deleteConfirmationState = signal<{ id: string; name: string } | null>(null);
+  private readonly sheetService = inject(GoogleSheetService);
+  private sheetSyncIntervalId: number | null = null;
+  private sheetSyncSubscription: Subscription | null = null;
+  private readonly sheetSyncIntervalMs = 30_000;
+  protected readonly sheetSyncError = signal<string | null>(null);
 
   protected readonly serverOptions: ReadonlyArray<{ value: ServerType; label: string }> = [
     { value: 'own', label: 'บอสในเซิฟเวอร์ตัวเอง' },
@@ -167,6 +175,7 @@ export class App implements OnDestroy {
   constructor() {
     this.startNowTicker();
     this.initSpeechSynthesis();
+    this.startSheetSync();
     console.log('test');
   }
 
@@ -579,6 +588,7 @@ export class App implements OnDestroy {
   }
 
   ngOnDestroy(): void {
+    this.cleanupSheetSync();
     this.clearAlertTimers();
     this.clearRemovalTimers();
     this.clearCountdown();
@@ -683,6 +693,164 @@ export class App implements OnDestroy {
   private refreshBossesSignal(): void {
     this.bosses.set([...this.entries]);
     this.ensureValidClanFilter();
+  }
+
+  private startSheetSync(): void {
+    this.fetchSheetEntries();
+    if (typeof window === 'undefined') {
+      return;
+    }
+    this.sheetSyncIntervalId = window.setInterval(() => {
+      this.fetchSheetEntries();
+    }, this.sheetSyncIntervalMs);
+  }
+
+  private fetchSheetEntries(): void {
+    this.sheetSyncSubscription?.unsubscribe();
+    this.sheetSyncSubscription = this.sheetService.fetchBossList().subscribe({
+      next: (items) => {
+        this.sheetSyncError.set(null);
+        this.mergeSheetEntries(items);
+      },
+      error: (error) => {
+        const message = error?.message ?? 'ซิงก์ข้อมูลจาก Google Sheet ไม่สำเร็จ';
+        this.sheetSyncError.set(message);
+      }
+    });
+  }
+
+  private cleanupSheetSync(): void {
+    this.sheetSyncSubscription?.unsubscribe();
+    this.sheetSyncSubscription = null;
+    if (typeof window !== 'undefined' && this.sheetSyncIntervalId !== null) {
+      window.clearInterval(this.sheetSyncIntervalId);
+      this.sheetSyncIntervalId = null;
+    }
+  }
+
+  private mergeSheetEntries(items: SheetBossListItem[]): void {
+    const desiredKeys = new Set<string>();
+
+    for (const item of items ?? []) {
+      if (!item || !item.bossName || !item.formattedTime) {
+        continue;
+      }
+      const sourceKey = this.buildSheetSourceKey(item);
+      desiredKeys.add(sourceKey);
+      const existing = this.entries.find((entry) => entry.sourceKey === sourceKey);
+      if (existing) {
+        this.updateEntryFromSheet(existing, item);
+      } else {
+        const newEntry = this.createEntryFromSheet(item, sourceKey);
+        this.entries.push(newEntry);
+      }
+    }
+
+    this.pruneSheetEntries(desiredKeys);
+    this.sortEntries();
+    this.refreshBossesSignal();
+    this.scheduleAlerts();
+  }
+
+  private pruneSheetEntries(validKeys: Set<string>): void {
+    for (let index = this.entries.length - 1; index >= 0; index--) {
+      const entry = this.entries[index];
+      if (!entry.sourceKey) {
+        continue;
+      }
+      if (!validKeys.has(entry.sourceKey)) {
+        if (this.activeAlert()?.id === entry.id) {
+          this.stopAlert();
+        }
+        this.clearRemovalTimer(entry.id);
+        this.clearTimerFor(entry.id);
+        this.removeFromQueue(entry.id);
+        this.entries.splice(index, 1);
+      }
+    }
+  }
+
+  private createEntryFromSheet(item: SheetBossListItem, sourceKey: string): BossEntry {
+    const { name, map } = this.extractNameAndMap(item.bossName);
+    const clan = (item.owner ?? '').trim() || 'ไม่ระบุ';
+    const spawnTime = this.computeNextOccurrence(item.formattedTime);
+    const spawnLabel = DISPLAY_FORMAT.format(spawnTime);
+    const leadMinutes = DEFAULT_LEAD_MINUTES;
+    const alertTime = new Date(spawnTime.getTime() - leadMinutes * MINUTE_MS);
+    const alertLabel = DISPLAY_FORMAT.format(alertTime);
+
+    return {
+      id: this.generateId(),
+      name,
+      map,
+      clan,
+      serverType: 'own',
+      spawnTime,
+      spawnLabel,
+      alertTime,
+      alertLabel,
+      createdOrder: this.orderCounter++,
+      alertTriggered: false,
+      triggeredAt: null,
+      leadMinutes,
+      sourceKey
+    };
+  }
+
+  private updateEntryFromSheet(target: BossEntry, item: SheetBossListItem): void {
+    const { name, map } = this.extractNameAndMap(item.bossName);
+    const clan = (item.owner ?? '').trim() || 'ไม่ระบุ';
+    const spawnTime = this.computeNextOccurrence(item.formattedTime);
+    const spawnLabel = DISPLAY_FORMAT.format(spawnTime);
+
+    const spawnChanged = target.spawnTime.getTime() !== spawnTime.getTime();
+    const detailsChanged = target.name !== name || target.map !== map || target.clan !== clan;
+    if (!spawnChanged && !detailsChanged) {
+      return;
+    }
+
+    target.name = name;
+    target.map = map;
+    target.clan = clan;
+    target.spawnTime = spawnTime;
+    target.spawnLabel = spawnLabel;
+
+    const leadMinutes = Math.max(0, Math.floor(target.leadMinutes ?? DEFAULT_LEAD_MINUTES));
+    const alertTime = new Date(spawnTime.getTime() - leadMinutes * MINUTE_MS);
+    target.alertTime = alertTime;
+    target.alertLabel = DISPLAY_FORMAT.format(alertTime);
+
+    if (spawnChanged) {
+      target.alertTriggered = false;
+      target.triggeredAt = null;
+    }
+
+    this.clearTimerFor(target.id);
+    this.removeFromQueue(target.id);
+  }
+
+  private buildSheetSourceKey(item: SheetBossListItem): string {
+    return `${item.formattedTime}|${item.bossName}|${item.owner ?? ''}`;
+  }
+
+  private extractNameAndMap(rawName: string): { name: string; map: string } {
+    const sanitized = (rawName ?? '').replace(/\*/g, '').trim();
+    if (!sanitized) {
+      return { name: 'ไม่ทราบชื่อ', map: 'ไม่ระบุ' };
+    }
+
+    const lastOpen = sanitized.lastIndexOf('(');
+    const lastClose = sanitized.lastIndexOf(')');
+    if (lastOpen !== -1 && lastClose > lastOpen) {
+      const map = sanitized.slice(lastOpen + 1, lastClose).trim();
+      const base = sanitized.slice(0, lastOpen).replace(/[\-\s]+$/u, '').trim();
+      return {
+        name: base || sanitized,
+        map: map || 'ไม่ระบุ'
+      };
+    }
+
+    return { name: sanitized, map: 'ไม่ระบุ' };
   }
 
   private scheduleAlerts(): void {

@@ -126,6 +126,10 @@
       </select>
     </div>
 
+    @if (sheetSyncError()) {
+      <p class="control-bar__hint control-bar__hint--warning" role="alert">{{ sheetSyncError() }}</p>
+    }
+
     <div class="tab-group" role="tablist" aria-label="Boss data tabs">
       <button
         type="button"
