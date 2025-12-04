@@ -56,8 +56,10 @@ interface BossEntry {
   createdOrder: number;
   alertTriggered: boolean;
   triggeredAt: Date | null;
+  historyLoggedAt?: Date | null;
   leadMinutes: number;
   sourceKey?: string | null;
+  sheetSignature?: string | null;
 }
 
 interface BossHistoryEntry {
@@ -112,6 +114,9 @@ export class App implements OnDestroy {
   private activeUtterance: SpeechSynthesisUtterance | null = null;
   private activeSpeechEntryId: string | null = null;
   private activeAudioElement: HTMLAudioElement | null = null;
+  private previewAudioElement: HTMLAudioElement | null = null;
+  private previewUtterance: SpeechSynthesisUtterance | null = null;
+  private previewTimeoutId: number | null = null;
   private readonly uploadedSoundUrls = new Map<string, string>();
   private readonly builtinAudioOptions: readonly AlertSoundOption[] = buildBuiltinSoundOptions();
   private readonly uploadedSoundOptions = signal<AlertSoundOption[]>([]);
@@ -120,6 +125,7 @@ export class App implements OnDestroy {
   private sheetSyncIntervalId: number | null = null;
   private sheetSyncSubscription: Subscription | null = null;
   private readonly sheetSyncIntervalMs = 30_000;
+  private readonly sheetCacheKey = 'boss-alarm.sheet-cache';
   protected readonly sheetSyncError = signal<string | null>(null);
 
   protected readonly serverOptions: ReadonlyArray<{ value: ServerType; label: string }> = [
@@ -142,6 +148,8 @@ export class App implements OnDestroy {
   protected readonly speechVoiceLabel = signal('กำลังเตรียมเสียง...');
   protected readonly uploadError = signal<string | null>(null);
   protected readonly selectedAlertSoundId = signal<string>('tts-default');
+  protected readonly isTestingAlertSound = signal(false);
+  protected readonly soundTestMessage = signal<string | null>(null);
   protected readonly alertSoundOptions = computed<readonly AlertSoundOption[]>(() => {
     const voiceLabel = this.speechVoiceLabel();
     const isSpeechReady = this.speechAvailable();
@@ -175,6 +183,7 @@ export class App implements OnDestroy {
   constructor() {
     this.startNowTicker();
     this.initSpeechSynthesis();
+    this.restoreSheetEntriesFromCache();
     this.startSheetSync();
     console.log('test');
   }
@@ -321,6 +330,42 @@ export class App implements OnDestroy {
     input.value = '';
   }
 
+  protected testAlertSound(): void {
+    if (this.activeAlert()) {
+      return;
+    }
+
+    if (this.isTestingAlertSound()) {
+      this.stopPreviewOutputs();
+      this.soundTestMessage.set(null);
+      return;
+    }
+
+    const option = this.ensureSelectedAlertSound();
+    if (!option) {
+      this.soundTestMessage.set('กรุณาเลือกเสียงแจ้งเตือนก่อน');
+      return;
+    }
+
+    this.soundTestMessage.set(null);
+    this.stopPreviewOutputs();
+
+    if (option.type === 'audio' && option.source) {
+      this.startPreviewAudio(option.source);
+      return;
+    }
+
+    if (option.type === 'tts') {
+      if (this.startPreviewSpeech()) {
+        return;
+      }
+      this.soundTestMessage.set('ไม่สามารถทดสอบเสียงพูดได้บนอุปกรณ์นี้');
+      return;
+    }
+
+    this.soundTestMessage.set('ไม่สามารถทดสอบเสียงนี้ได้');
+  }
+
   protected removeUploadedSound(soundId: string): void {
     let selectionChanged = false;
     if (this.selectedAlertSoundId() === soundId) {
@@ -361,11 +406,7 @@ export class App implements OnDestroy {
   }
 
   protected filteredHistory(): readonly BossHistoryEntry[] {
-    const filter = this.clanFilter();
-    if (filter === 'all') {
-      return this.history();
-    }
-    return this.history().filter((entry) => entry.clan === filter);
+    return this.history();
   }
 
   private handleClanFilterChange(): void {
@@ -592,6 +633,7 @@ export class App implements OnDestroy {
     this.clearAlertTimers();
     this.clearRemovalTimers();
     this.clearCountdown();
+    this.stopPreviewOutputs();
     if (typeof window !== 'undefined') {
       if (this.nowTickerId !== null) {
         window.clearInterval(this.nowTickerId);
@@ -728,7 +770,7 @@ export class App implements OnDestroy {
     }
   }
 
-  private mergeSheetEntries(items: SheetBossListItem[]): void {
+  private mergeSheetEntries(items: SheetBossListItem[], options?: { skipCacheWrite?: boolean }): void {
     const desiredKeys = new Set<string>();
 
     for (const item of items ?? []) {
@@ -736,12 +778,19 @@ export class App implements OnDestroy {
         continue;
       }
       const sourceKey = this.buildSheetSourceKey(item);
+      const sheetSignature = this.buildSheetSignature(item);
       desiredKeys.add(sourceKey);
-      const existing = this.entries.find((entry) => entry.sourceKey === sourceKey);
+      let existing = this.entries.find((entry) => entry.sourceKey === sourceKey);
+      if (!existing && sheetSignature) {
+        existing = this.findEntryBySheetSignature(sheetSignature);
+        if (existing) {
+          existing.sourceKey = sourceKey;
+        }
+      }
       if (existing) {
-        this.updateEntryFromSheet(existing, item);
+        this.updateEntryFromSheet(existing, item, sheetSignature);
       } else {
-        const newEntry = this.createEntryFromSheet(item, sourceKey);
+        const newEntry = this.createEntryFromSheet(item, sourceKey, sheetSignature);
         this.entries.push(newEntry);
       }
     }
@@ -750,6 +799,74 @@ export class App implements OnDestroy {
     this.sortEntries();
     this.refreshBossesSignal();
     this.scheduleAlerts();
+    if (!options?.skipCacheWrite) {
+      this.persistSheetCache(items);
+    }
+  }
+
+  private restoreSheetEntriesFromCache(): void {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return;
+    }
+
+    const cachedItems = this.readCachedSheetItems();
+    if (!cachedItems.length) {
+      return;
+    }
+
+    this.mergeSheetEntries(cachedItems, { skipCacheWrite: true });
+  }
+
+  private readCachedSheetItems(): SheetBossListItem[] {
+    try {
+      const raw = window.localStorage.getItem(this.sheetCacheKey);
+      if (!raw) {
+        return [];
+      }
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) {
+        return [];
+      }
+      const validItems: SheetBossListItem[] = [];
+      for (const item of parsed) {
+        if (this.isValidSheetItem(item)) {
+          validItems.push({
+            bossName: item.bossName,
+            owner: item.owner ?? '',
+            formattedTime: item.formattedTime
+          });
+        }
+      }
+      return validItems;
+    } catch (error) {
+      console.warn('Failed to read sheet cache', error);
+      return [];
+    }
+  }
+
+  private persistSheetCache(items: SheetBossListItem[]): void {
+    if (typeof window === 'undefined' || !window.localStorage) {
+      return;
+    }
+
+    try {
+      const payload = (items ?? []).map((item) => ({
+        bossName: item.bossName,
+        owner: item.owner ?? '',
+        formattedTime: item.formattedTime
+      }));
+      window.localStorage.setItem(this.sheetCacheKey, JSON.stringify(payload));
+    } catch (error) {
+      console.warn('Failed to persist sheet cache', error);
+    }
+  }
+
+  private isValidSheetItem(value: unknown): value is SheetBossListItem {
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+    const candidate = value as Record<string, unknown>;
+    return typeof candidate['bossName'] === 'string' && typeof candidate['formattedTime'] === 'string';
   }
 
   private pruneSheetEntries(validKeys: Set<string>): void {
@@ -770,7 +887,7 @@ export class App implements OnDestroy {
     }
   }
 
-  private createEntryFromSheet(item: SheetBossListItem, sourceKey: string): BossEntry {
+  private createEntryFromSheet(item: SheetBossListItem, sourceKey: string, sheetSignature: string | null): BossEntry {
     const { name, map } = this.extractNameAndMap(item.bossName);
     const clan = (item.owner ?? '').trim() || 'ไม่ระบุ';
     const spawnTime = this.computeNextOccurrence(item.formattedTime);
@@ -792,12 +909,21 @@ export class App implements OnDestroy {
       createdOrder: this.orderCounter++,
       alertTriggered: false,
       triggeredAt: null,
+      historyLoggedAt: null,
       leadMinutes,
-      sourceKey
+      sourceKey,
+      sheetSignature: sheetSignature ?? null
     };
   }
 
-  private updateEntryFromSheet(target: BossEntry, item: SheetBossListItem): void {
+  private updateEntryFromSheet(target: BossEntry, item: SheetBossListItem, sheetSignature: string | null): void {
+    if (this.isEntryLocked(target)) {
+      if (sheetSignature) {
+        target.sheetSignature = sheetSignature;
+      }
+      return;
+    }
+
     const { name, map } = this.extractNameAndMap(item.bossName);
     const clan = (item.owner ?? '').trim() || 'ไม่ระบุ';
     const spawnTime = this.computeNextOccurrence(item.formattedTime);
@@ -814,6 +940,9 @@ export class App implements OnDestroy {
     target.clan = clan;
     target.spawnTime = spawnTime;
     target.spawnLabel = spawnLabel;
+    if (sheetSignature) {
+      target.sheetSignature = sheetSignature;
+    }
 
     const leadMinutes = Math.max(0, Math.floor(target.leadMinutes ?? DEFAULT_LEAD_MINUTES));
     const alertTime = new Date(spawnTime.getTime() - leadMinutes * MINUTE_MS);
@@ -823,6 +952,8 @@ export class App implements OnDestroy {
     if (spawnChanged) {
       target.alertTriggered = false;
       target.triggeredAt = null;
+      target.historyLoggedAt = null;
+      this.clearRemovalTimer(target.id);
     }
 
     this.clearTimerFor(target.id);
@@ -831,6 +962,46 @@ export class App implements OnDestroy {
 
   private buildSheetSourceKey(item: SheetBossListItem): string {
     return `${item.formattedTime}|${item.bossName}|${item.owner ?? ''}`;
+  }
+
+  private buildSheetSignature(item: SheetBossListItem): string | null {
+    if (!item.bossName || !item.formattedTime) {
+      return null;
+    }
+    const time = this.normalizeTime(item.formattedTime);
+    const normalizedName = this.normalizeSheetName(item.bossName);
+    if (!normalizedName) {
+      return null;
+    }
+    return `${time}|${normalizedName}`;
+  }
+
+  private normalizeSheetName(value: string): string {
+    return value
+      .replace(/\*/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  private findEntryBySheetSignature(signature: string | null): BossEntry | undefined {
+    if (!signature) {
+      return undefined;
+    }
+    return this.entries.find((entry) => entry.sheetSignature === signature);
+  }
+
+  private isEntryLocked(entry: BossEntry): boolean {
+    const active = this.activeAlert();
+    if (active && active.id === entry.id) {
+      return true;
+    }
+    if (!entry.triggeredAt) {
+      return false;
+    }
+    const now = Date.now();
+    const triggeredAtMs = entry.triggeredAt.getTime();
+    return now - triggeredAtMs < 2 * MINUTE_MS;
   }
 
   private extractNameAndMap(rawName: string): { name: string; map: string } {
@@ -877,6 +1048,9 @@ export class App implements OnDestroy {
       if (!this.shouldAlertFor(entry)) {
         continue;
       }
+      if (this.isEntryLocked(entry) || this.pendingAlertIds.includes(entry.id)) {
+        continue;
+      }
       const delay = entry.alertTime.getTime() - now;
       if (delay <= 0) {
         this.enqueueAlert(entry.id);
@@ -896,6 +1070,10 @@ export class App implements OnDestroy {
   private triggerAlert(entryId: string, invokedFromQueue = false): void {
     const entry = this.entries.find((item) => item.id === entryId);
     if (!entry) {
+      return;
+    }
+
+    if (entry.alertTriggered && entry.triggeredAt && this.isEntryLocked(entry)) {
       return;
     }
 
@@ -951,7 +1129,7 @@ export class App implements OnDestroy {
         return;
       }
       const entry = this.entries.find((item) => item.id === nextId);
-      if (!entry || entry.alertTriggered || !this.shouldAlertFor(entry)) {
+      if (!entry || entry.alertTriggered || !this.shouldAlertFor(entry) || this.isEntryLocked(entry)) {
         continue;
       }
       this.triggerAlert(nextId, true);
@@ -1001,6 +1179,7 @@ export class App implements OnDestroy {
   }
 
   private playAlarmFor(entry: BossEntry): void {
+    this.stopPreviewOutputs();
     const selectedOption = this.ensureSelectedAlertSound();
 
     if (selectedOption?.type === 'audio') {
@@ -1324,6 +1503,10 @@ export class App implements OnDestroy {
   }
 
   private recordHistory(entry: BossEntry, triggeredAt: Date): void {
+    if (entry.historyLoggedAt && Math.abs(entry.historyLoggedAt.getTime() - triggeredAt.getTime()) < 1000) {
+      return;
+    }
+
     const historyEntry: BossHistoryEntry = {
       id: entry.id,
       name: entry.name,
@@ -1340,6 +1523,7 @@ export class App implements OnDestroy {
     this.historyLog.unshift(historyEntry);
     this.history.set([...this.historyLog]);
     this.ensureValidClanFilter();
+    entry.historyLoggedAt = triggeredAt;
   }
 
   private ensureValidClanFilter(): void {
@@ -1494,6 +1678,118 @@ export class App implements OnDestroy {
     });
 
     return true;
+  }
+
+  private startPreviewAudio(source: string): void {
+    if (typeof Audio === 'undefined') {
+      this.soundTestMessage.set('อุปกรณ์นี้ไม่รองรับการเล่นไฟล์เสียง');
+      return;
+    }
+
+    this.isTestingAlertSound.set(true);
+
+    const audio = new Audio(source);
+    audio.loop = false;
+    audio.volume = Math.max(0, Math.min(1, this.volumePercent() / 100));
+
+    audio.onended = () => {
+      if (this.previewAudioElement === audio) {
+        this.previewAudioElement = null;
+      }
+      this.stopPreviewOutputs();
+    };
+
+    audio.onerror = () => {
+      if (this.previewAudioElement === audio) {
+        this.previewAudioElement = null;
+      }
+      this.stopPreviewOutputs();
+      this.soundTestMessage.set('เล่นไฟล์เสียงไม่ได้');
+    };
+
+    this.previewAudioElement = audio;
+
+    if (typeof window !== 'undefined') {
+      this.clearPreviewTimeout();
+      this.previewTimeoutId = window.setTimeout(() => this.stopPreviewOutputs(), 5000);
+    }
+
+    void audio.play().catch(() => {
+      if (this.previewAudioElement === audio) {
+        this.previewAudioElement = null;
+      }
+      this.stopPreviewOutputs();
+      this.soundTestMessage.set('เล่นไฟล์เสียงไม่ได้');
+    });
+  }
+
+  private startPreviewSpeech(): boolean {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window) || typeof SpeechSynthesisUtterance === 'undefined') {
+      return false;
+    }
+
+    const utterance = new SpeechSynthesisUtterance('นี่คือเสียงทดสอบแจ้งเตือนบอส');
+    utterance.lang = this.speechVoice?.lang ?? 'th-TH';
+    if (this.speechVoice) {
+      utterance.voice = this.speechVoice;
+    }
+    utterance.volume = Math.max(0, Math.min(1, this.volumePercent() / 100));
+    utterance.rate = 1;
+    utterance.pitch = 1;
+
+    utterance.onend = () => {
+      if (this.previewUtterance === utterance) {
+        this.previewUtterance = null;
+      }
+      this.stopPreviewOutputs();
+    };
+
+    utterance.onerror = () => {
+      if (this.previewUtterance === utterance) {
+        this.previewUtterance = null;
+      }
+      this.stopPreviewOutputs();
+      this.soundTestMessage.set('ไม่สามารถทดสอบเสียงพูดได้');
+    };
+
+    try {
+      this.isTestingAlertSound.set(true);
+      this.previewUtterance = utterance;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utterance);
+      return true;
+    } catch {
+      this.previewUtterance = null;
+      this.stopPreviewOutputs();
+      return false;
+    }
+  }
+
+  private stopPreviewOutputs(): void {
+    if (this.previewAudioElement) {
+      this.previewAudioElement.pause();
+      this.previewAudioElement.currentTime = 0;
+      this.previewAudioElement = null;
+    }
+
+    if (typeof window !== 'undefined' && this.previewUtterance) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore inability to cancel preview speech
+      }
+    }
+    this.previewUtterance = null;
+
+    this.clearPreviewTimeout();
+    this.isTestingAlertSound.set(false);
+  }
+
+  private clearPreviewTimeout(): void {
+    if (typeof window !== 'undefined' && this.previewTimeoutId !== null) {
+      window.clearTimeout(this.previewTimeoutId);
+    }
+    this.previewTimeoutId = null;
   }
 
   private stopActiveAudio(immediate = false): void {

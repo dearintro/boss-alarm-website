@@ -40,6 +40,26 @@
             }
           </select>
         </div>
+        <div class="control-bar__actions">
+          <button
+            type="button"
+            class="ghost-button ghost-button--wide"
+            [disabled]="isTestingAlertSound() || !!activeAlert()"
+            (click)="testAlertSound()"
+          >
+            @if (isTestingAlertSound()) {
+              <span>หยุดเสียงทดสอบ</span>
+            } @else {
+              <span>ทดสอบเสียงแจ้งเตือน</span>
+            }
+          </button>
+        </div>
+        @if (soundTestMessage()) {
+          <p class="control-bar__hint control-bar__hint--warning">{{ soundTestMessage() }}</p>
+        }
+        @if (activeAlert()) {
+          <p class="control-bar__hint control-bar__hint--warning">หยุดการแจ้งเตือนก่อนจึงจะทดสอบเสียงได้</p>
+        }
         @if (!speechAvailable()) {
           <p class="control-bar__hint control-bar__hint--warning">
             เบราว์เซอร์ของคุณไม่รองรับการอ่านข้อความเป็นเสียง ระบบจะใช้ไฟล์เสียงที่เลือกแทน
@@ -261,9 +281,8 @@
       @if (activeTab() === 'history') {
         @if (history().length === 0) {
           <p class="empty-state">ยังไม่มีประวัติบอสที่แจ้งเตือน</p>
-        } @else if (filteredHistory().length === 0) {
-          <p class="empty-state empty-state--muted">ไม่มีประวัติที่ตรงกับแคลนนี้</p>
         } @else {
+          <p class="control-bar__hint">ประวัติด้านล่างแสดงทุกแคลนโดยอัตโนมัติ</p>
           <div class="table-wrapper">
             <table class="boss-table">
               <thead>
